@@ -136,13 +136,45 @@ class RepositoryMixin:
                     except Exception:
                         pass
 
+            # Parse container information
+            pack_code_requested = None
+            container_type = None
+            container_size_min = None
+            container_size_max = None
+
+            container_type_raw = item.get("container_type")
+            container_size_raw = item.get("container_size")
+
+            if container_type_raw and container_size_raw:
+                container_type = str(container_type_raw).strip()
+                container_size_str = str(container_size_raw).strip()
+
+                # Check if container_size is a range (e.g., "5-7")
+                if "-" in container_size_str:
+                    pack_code_requested = f"{container_type}{container_size_str}"
+                    parts = container_size_str.split("-")
+                    try:
+                        container_size_min = Decimal(parts[0])
+                        container_size_max = Decimal(parts[1])
+                    except Exception:
+                        pass
+                else:
+                    # Single value
+                    pack_code_requested = f"{container_type}{container_size_str}"
+                    try:
+                        container_size_min = Decimal(container_size_str)
+                        container_size_max = container_size_min
+                    except Exception:
+                        pass
+
             cursor.execute(
                 """
                 INSERT INTO order_items (
                     order_id, line_no, raw_name, lang, qty, qty_unit,
-                    height_text, height_min, height_max, height_unit
+                    height_text, height_min, height_max, height_unit,
+                    pack_code_requested, container_type, container_size_min, container_size_max
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
                 (
                     order_id,
@@ -155,6 +187,10 @@ class RepositoryMixin:
                     height_min,
                     height_max,
                     height_unit,
+                    pack_code_requested,
+                    container_type,
+                    container_size_min,
+                    container_size_max,
                 ),
             )
 
@@ -257,11 +293,15 @@ class RepositoryMixin:
 
         cursor = self.conn.cursor()
 
+        # Pass container matching parameters from config
+        allow_alike = self.config.allow_alike_containers
+        alike_tolerance = self.config.alike_tolerance
+
         cursor.execute(
             """
-            SELECT fn_get_order_candidates(%s)
+            SELECT fn_get_order_candidates(%s, %s, %s)
         """,
-            (order_id,),
+            (order_id, allow_alike, alike_tolerance),
         )
 
         candidates = cursor.fetchone()[0]
@@ -272,6 +312,8 @@ class RepositoryMixin:
         self.log(
             f"  -> Got {len(items)} items, {total_candidates} total candidates"
         )
+        if allow_alike:
+            self.log(f"     Container alike mode: enabled (tolerance=±{alike_tolerance})")
 
         cursor.close()
         return candidates
@@ -363,9 +405,9 @@ class RepositoryMixin:
             cursor.execute(
                 """
                 INSERT INTO item_assignments (
-                    run_id, order_id, line_no, supplier_id, pack_code, unit_price, currency
+                    run_id, order_id, line_no, supplier_id, pack_code, pack_match_status, unit_price, currency
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """,
                 (
                     run_id,
@@ -373,6 +415,7 @@ class RepositoryMixin:
                     assignment["line_no"],
                     assignment["supplier_id"],
                     assignment["pack_code"],
+                    assignment.get("pack_match_status"),
                     assignment["price"],
                     "RUB",
                 ),
@@ -472,7 +515,7 @@ class RepositoryMixin:
 
         run = cursor.fetchone()
 
-        # Get item assignments
+        # Get item assignments with container info
         cursor.execute(
             """
             SELECT
@@ -480,6 +523,10 @@ class RepositoryMixin:
                 oi.raw_name,
                 oi.qty,
                 oi.qty_unit,
+                oi.pack_code_requested,
+                oi.container_type,
+                oi.container_size_min,
+                oi.container_size_max,
                 p.canonical_name,
                 s.name as supplier_name
             FROM item_assignments ia
@@ -525,6 +572,33 @@ class RepositoryMixin:
         for a in assignments:
             key = (a["line_no"], a["supplier_id"])
             unit_price = float(a["unit_price"])
+
+            # Build container_requested info
+            container_requested = None
+            if a.get("pack_code_requested"):
+                size_range = None
+                if a.get("container_size_min") and a.get("container_size_max"):
+                    size_min = float(a["container_size_min"])
+                    size_max = float(a["container_size_max"])
+                    if size_min != size_max:
+                        size_range = f"{int(size_min)}-{int(size_max)}"
+
+                container_requested = {
+                    "pack_code": a["pack_code_requested"],
+                    "type": a.get("container_type"),
+                    "size": float(a["container_size_min"]) if a.get("container_size_min") else None,
+                    "size_max": float(a["container_size_max"]) if a.get("container_size_max") else None,
+                    "size_range": size_range,
+                }
+
+            # Build container_matched info
+            container_matched = None
+            if a.get("pack_code"):
+                container_matched = {
+                    "pack_code": a["pack_code"],
+                    "match_status": a.get("pack_match_status"),
+                }
+
             entry = {
                 "line_no": a["line_no"],
                 "raw_name": a["raw_name"],
@@ -537,9 +611,16 @@ class RepositoryMixin:
                 "line_total": unit_price * a["qty"],
                 "currency": a["currency"],
             }
+
+            if container_requested:
+                entry["container_requested"] = container_requested
+            if container_matched:
+                entry["container_matched"] = container_matched
+
             shortage_pct = shortage_lookup.get(key)
             if shortage_pct is not None:
                 entry["shortage_pct"] = shortage_pct
+
             assignment_entries.append(entry)
 
         # Build output

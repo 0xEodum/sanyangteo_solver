@@ -26,7 +26,11 @@ class SolverMixin:
         enriched_payload: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
         """
-        Solve supplier assignment using CP-SAT.
+        Solve supplier assignment using CP-SAT with candidate-level variables.
+
+        NEW MODEL:
+        - x[candidate_idx] - choose specific candidate (item, supplier, pack_code, price)
+        - y[supplier_id] - supplier is used
 
         Only processes items that go_to_solver=True.
         """
@@ -38,7 +42,10 @@ class SolverMixin:
         self.last_solver_info = {
             "solver": "ortools_cp_sat",
             "status": "NOT_STARTED",
-            "parameters": {"timeout_seconds": self.config.solver_timeout},
+            "parameters": {
+                "timeout_seconds": self.config.solver_timeout,
+                "optimization_priority": self.config.optimization_priority,
+            },
             "model_stats": {"total_items_received": len(items)},
             "constraint_audit": {"min_order_amount": []},
         }
@@ -59,102 +66,125 @@ class SolverMixin:
             )
             return None
 
-        supplier_ids = set()
-        for item in solver_items:
+        # Build flat list of candidates with indices
+        all_candidates: List[Dict[str, Any]] = []
+        item_candidate_map: Dict[int, List[int]] = {}  # item_idx -> [candidate_indices]
+
+        for item_idx, item in enumerate(solver_items):
+            candidate_indices = []
             for candidate in item["candidates"]:
-                supplier_ids.add(candidate["supplier_id"])
+                candidate_idx = len(all_candidates)
+                candidate_indices.append(candidate_idx)
+                all_candidates.append({
+                    "candidate_idx": candidate_idx,
+                    "item_idx": item_idx,
+                    "line_no": item["line_no"],
+                    "qty": item["qty"],
+                    "supplier_id": candidate["supplier_id"],
+                    "pack_code": candidate.get("pack_code"),
+                    "pack_match_status": candidate.get("pack_match_status"),
+                    "price": candidate["price"],
+                    "shortage_pct": candidate.get("shortage_pct"),
+                })
+            item_candidate_map[item_idx] = candidate_indices
 
-        supplier_ids = sorted(supplier_ids)
+        supplier_ids = sorted(set(c["supplier_id"] for c in all_candidates))
 
-        self.last_solver_info["model_stats"]["suppliers_considered"] = len(supplier_ids)
+        self.last_solver_info["model_stats"].update({
+            "suppliers_considered": len(supplier_ids),
+            "total_candidates": len(all_candidates),
+        })
 
         self.log(
-            f"  -> Problem: {len(solver_items)} items, {len(supplier_ids)} suppliers"
+            f"  -> Problem: {len(solver_items)} items, "
+            f"{len(all_candidates)} candidates, {len(supplier_ids)} suppliers"
         )
 
         model = cp_model.CpModel()
 
-        x: Dict[Tuple[int, int], cp_model.IntVar] = {}
-        for i, item in enumerate(solver_items):
-            line_no = item["line_no"]
-            for candidate in item["candidates"]:
-                supplier = candidate["supplier_id"]
-                x[i, supplier] = model.NewBoolVar(f"x_i{line_no}_s{supplier}")
+        # x[candidate_idx] - binary variable for each candidate
+        x: Dict[int, cp_model.IntVar] = {}
+        for cand in all_candidates:
+            cand_idx = cand["candidate_idx"]
+            x[cand_idx] = model.NewBoolVar(
+                f"x_c{cand_idx}_i{cand['line_no']}_s{cand['supplier_id']}"
+            )
 
-        y = {supplier: model.NewBoolVar(f"y_s{supplier}") for supplier in supplier_ids}
+        # y[supplier_id] - binary variable for each supplier
+        y = {s_id: model.NewBoolVar(f"y_s{s_id}") for s_id in supplier_ids}
 
-        for i, item in enumerate(solver_items):
-            available_suppliers = [cand["supplier_id"] for cand in item["candidates"]]
-            model.Add(sum(x[i, supplier] for supplier in available_suppliers) == 1)
+        # Constraint: Each item must select exactly 1 candidate
+        for item_idx, candidate_indices in item_candidate_map.items():
+            model.Add(sum(x[c_idx] for c_idx in candidate_indices) == 1)
 
-        for i, item in enumerate(solver_items):
-            for candidate in item["candidates"]:
-                supplier = candidate["supplier_id"]
-                model.Add(x[i, supplier] <= y[supplier])
+        # Constraint: x[candidate] <= y[supplier] (link candidates to suppliers)
+        for cand in all_candidates:
+            model.Add(x[cand["candidate_idx"]] <= y[cand["supplier_id"]])
 
-        for supplier in supplier_ids:
-            rules = suppliers_info[supplier].get("rules", {})
+        # Constraint: Min order amount per supplier
+        for supplier_id in supplier_ids:
+            rules = suppliers_info[supplier_id].get("rules", {})
             constraints = rules.get("constraints", {})
             min_order_amount = constraints.get("min_order_amount")
 
             if min_order_amount:
-                supplier_items: List[Tuple[int, int]] = []
+                supplier_candidates = [c for c in all_candidates if c["supplier_id"] == supplier_id]
                 audit_entry = {
-                    "supplier_id": supplier,
+                    "supplier_id": supplier_id,
                     "min_order_amount": float(min_order_amount),
                     "lines": [],
                 }
-                for i, item in enumerate(solver_items):
-                    qty = item["qty"]
-                    for candidate in item["candidates"]:
-                        if candidate["supplier_id"] == supplier:
-                            price = candidate["price"]
-                            if price is None:
-                                continue
-                            line_total = float(price) * qty
-                            amount_cents = int(line_total * 100)
-                            supplier_items.append((i, amount_cents))
-                            audit_entry["lines"].append(
-                                {
-                                    "line_no": item["line_no"],
-                                    "qty": qty,
-                                    "unit_price": float(price),
-                                    "line_total": round(line_total, 2),
-                                }
-                            )
-                            break
 
-                if supplier_items:
+                terms = []
+                for cand in supplier_candidates:
+                    price = cand["price"]
+                    if price is None:
+                        continue
+                    qty = cand["qty"]
+                    line_total = float(price) * qty
+                    amount_cents = int(line_total * 100)
+                    terms.append(amount_cents * x[cand["candidate_idx"]])
+
+                    audit_entry["lines"].append({
+                        "line_no": cand["line_no"],
+                        "qty": qty,
+                        "unit_price": float(price),
+                        "line_total": round(line_total, 2),
+                        "pack_code": cand["pack_code"],
+                    })
+
+                if terms:
                     min_amount_cents = int(float(min_order_amount) * 100)
-                    total_expr = sum(
-                        amount * x[index, supplier] for index, amount in supplier_items
-                    )
-                    model.Add(total_expr >= min_amount_cents * y[supplier])
+                    model.Add(sum(terms) >= min_amount_cents * y[supplier_id])
                     audit_entry["line_total_sum"] = round(
                         sum(line["line_total"] for line in audit_entry["lines"]), 2
                     )
-                    self.last_solver_info["constraint_audit"][
-                        "min_order_amount"
-                    ].append(audit_entry)
+                    self.last_solver_info["constraint_audit"]["min_order_amount"].append(audit_entry)
 
-        for i, item in enumerate(solver_items):
-            qty = item["qty"]
-            for candidate in item["candidates"]:
-                supplier = candidate["supplier_id"]
-                rules = suppliers_info[supplier].get("rules", {})
-                constraints = rules.get("constraints", {})
-                min_line_qty = constraints.get("min_line_qty")
+        # Objective function based on optimization_priority
+        if self.config.optimization_priority == "container_match":
+            # Minimize: suppliers * 1000 + container_penalties
+            # penalty = 1 for 'alike', 0 for 'exactly'
+            container_penalties = []
+            for cand in all_candidates:
+                penalty = 1 if cand.get("pack_match_status") == "alike" else 0
+                container_penalties.append(penalty * x[cand["candidate_idx"]])
 
-                if min_line_qty and qty < min_line_qty:
-                    model.Add(x[i, supplier] == 0)
-
-        model.Minimize(sum(y[supplier] for supplier in supplier_ids))
+            model.Minimize(
+                sum(y[s_id] for s_id in supplier_ids) * 1000 + sum(container_penalties)
+            )
+            self.log("  -> Optimization: prioritize exact container matches, then minimize suppliers")
+        else:
+            # Default: minimize number of suppliers only
+            model.Minimize(sum(y[s_id] for s_id in supplier_ids))
+            self.log("  -> Optimization: minimize number of suppliers")
 
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = float(self.config.solver_timeout)
 
         self.log("  -> Solving...")
         status = solver.Solve(model)
+
         self.last_solver_info.update(
             {
                 "status": solver.StatusName(status),
@@ -178,40 +208,33 @@ class SolverMixin:
             self.last_solver_info["reason"] = "solver_returned_no_solution"
             return None
 
+        # Extract solution
+        selected_suppliers = [s_id for s_id in supplier_ids if solver.Value(y[s_id]) == 1]
+
+        assignments = []
+        for cand in all_candidates:
+            if solver.Value(x[cand["candidate_idx"]]) == 1:
+                assignments.append({
+                    "line_no": cand["line_no"],
+                    "supplier_id": cand["supplier_id"],
+                    "pack_code": cand["pack_code"],
+                    "pack_match_status": cand.get("pack_match_status"),
+                    "price": float(cand["price"]),
+                    "qty": cand["qty"],
+                    "shortage_pct": cand.get("shortage_pct"),
+                })
+
         solution = {
             "status": solver.StatusName(status),
             "objective_value": solver.ObjectiveValue(),
-            "num_suppliers": int(solver.ObjectiveValue()),
-            "assignments": [],
-            "suppliers_used": [],
+            "num_suppliers": len(selected_suppliers),
+            "assignments": assignments,
+            "suppliers_used": selected_suppliers,
         }
         self.last_solver_info["objective_value"] = solver.ObjectiveValue()
-
-        for supplier in supplier_ids:
-            if solver.Value(y[supplier]) == 1:
-                solution["suppliers_used"].append(supplier)
-
-        for i, item in enumerate(solver_items):
-            line_no = item["line_no"]
-            qty = item["qty"]
-
-            for candidate in item["candidates"]:
-                supplier = candidate["supplier_id"]
-                if (i, supplier) in x and solver.Value(x[i, supplier]) == 1:
-                    solution["assignments"].append(
-                        {
-                            "line_no": line_no,
-                            "supplier_id": supplier,
-                            "pack_code": candidate.get("pack_code"),
-                            "price": float(candidate["price"]),
-                            "qty": qty,
-                            "shortage_pct": candidate.get("shortage_pct"),
-                        }
-                    )
-                    break
+        self.last_solver_info["suppliers_selected"] = selected_suppliers
 
         self.log(f"  -> Solution: {solution['num_suppliers']} suppliers used")
         self.log(f"     Suppliers: {solution['suppliers_used']}")
-        self.last_solver_info["suppliers_selected"] = solution["suppliers_used"]
 
         return solution

@@ -157,6 +157,8 @@ class OrderProcessor(
                             "details": min_order_shortfalls,
                         }
                     )
+                    # FIX: Ensure order_status consistency
+                    pipeline_context["order_status"] = order_status.value
                     pipeline_context["status_details"] = self._sanitize_for_context(
                         deepcopy(status_details)
                     )
